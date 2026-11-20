@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NRF_EPD 2.13" Dashboard</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #f0f2f5;
+      display: flex;
+      justify-content: center;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: #fff;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+    }
+    h2 {
+      text-align: center;
+      margin: 0 0 14px;
+      font-size: 20px;
+      color: #1f2937;
+    }
+    .preview-wrapper {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 14px;
+    }
+    canvas {
+      border: 2px solid #111;
+      background: #fff;
+      width: 100%;
+      max-width: 375px;
+      height: auto;
+      image-rendering: pixelated;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:active { opacity: 0.85; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #1d63dc; color: #fff; margin-bottom: 12px; }
+    .btn-dark { background: #374151; color: #fff; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-success { background: #15803d; color: #fff; margin-top: 10px; }
+    .row {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .row > * { flex: 1; }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      margin: 10px 0 6px;
+    }
+    input[type="file"], input[type="text"], select {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }
+    .status-text {
+      margin-top: 12px;
+      font-weight: 600;
+      font-size: 14px;
+      color: #111827;
+    }
+    .log-box {
+      margin-top: 8px;
+      background: #18181b;
+      color: #4ade80;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      padding: 10px;
+      border-radius: 8px;
+      height: 125px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .log-err { color: #f87171; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>NRF_EPD 2.13" Dashboard</h2>
+
+    <div class="preview-wrapper">
+      <canvas id="epdCanvas" width="250" height="128"></canvas>
+    </div>
+
+    <button id="btnConnect" class="btn-primary">1. Kết nối NRF_EPD_4E45</button>
+
+    <label for="imgInput">Khung trái (50%) - Chọn ảnh cá nhân / gia đình:</label>
+    <input type="file" id="imgInput" accept="image/*" />
+
+    <label for="quoteInput">Khung dưới phải (50%) - Nội dung / Ghi chú:</label>
+    <input type="text" id="quoteInput" value="Một ngày mới, một khởi đầu mới." />
+
+    <div class="row">
+      <select id="ditherMode">
+        <option value="dither" selected>Xử lý ảnh: Mịn nét (Dithering)</option>
+        <option value="threshold">Xử lý ảnh: Đen trắng gắt</option>
+      </select>
+      <select id="panelColorMode">
+        <option value="bw" selected>Màn hình: Đen Trắng (BW)</option>
+        <option value="bwr">Màn hình: 3 Màu Đen Đỏ Trắng (BWR)</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button id="btnPreview" class="btn-dark">Cập nhật giờ &amp;<br/>Xem trước</button>
+      <button id="btnClear" class="btn-danger">Xoá trắng màn hình</button>
+    </div>
+
+    <button id="btnSend" class="btn-success">2. Xoá cũ &amp; Gửi bố cục mới lên E-Ink</button>
+
+    <div id="statusLabel" class="status-text">Sẵn sàng kết nối</div>
+    <div id="logBox" class="log-box"></div>
+  </div>
+
+  <script>
+    const NRF52_SERVICE_UUID = '62750001-d828-918d-fb46-b6c11c675aec';
+    const NRF52_CHARACTERISTIC_UUID = '62750002-d828-918d-fb46-b6c11c675aec';
+
+    const NRF52_CMD_INIT = 0x01;
+    const NRF52_CMD_REFRESH = 0x05;
+    const NRF52_CMD_SET_TIME = 0x20;
+    const NRF52_CMD_WRITE_IMAGE = 0x30;
+
+    let bleDevice = null;
+    let gattServer = null;
+    let epdCharacteristic = null;
+    let nrf52ModelId = 1;
+    let nrf52ImageChunkSize = 128;
+    let loadedImage = null;
+    let isBusy = false;
+
+    const gattQueueTails = new WeakMap();
+    function enqueueGattWrite(characteristic, packet) {
+      const bytes = Uint8Array.from(packet);
+      const prev = gattQueueTails.get(characteristic) || Promise.resolve();
+      const job = prev.then(() => {
+        if (!gattServer || !gattServer.connected || characteristic !== epdCharacteristic) {
+          throw new Error('Kết nối Bluetooth đã ngắt.');
+        }
+        return characteristic.writeValueWithResponse(bytes);
+      });
+      gattQueueTails.set(characteristic, job.catch(() => {}));
+      return job;
+    }
+
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const canvas = document.getElementById('epdCanvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const logBox = document.getElementById('logBox');
+    const statusLabel = document.getElementById('statusLabel');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnSend = document.getElementById('btnSend');
+    const btnClear = document.getElementById('btnClear');
+    const btnPreview = document.getElementById('btnPreview');
+    const imgInput = document.getElementById('imgInput');
+    const quoteInput = document.getElementById('quoteInput');
+    const ditherMode = document.getElementById('ditherMode');
+    const panelColorMode = document.getElementById('panelColorMode');
+
+    function log(msg, isError = false) {
+      const line = document.createElement('div');
+      if (isError) line.className = 'log-err';
+      line.textContent = msg;
+      logBox.appendChild(line);
+      logBox.scrollTop = logBox.scrollHeight;
+      if (isError) statusLabel.textContent = 'Lỗi: ' + msg;
+    }
+
+    function roundRect(context, x, y, w, h, r) {
+      context.beginPath();
+      context.moveTo(x + r, y);
+      context.arcTo(x + w, y, x + w, y + h, r);
+      context.arcTo(x + w, y + h, x, y + h, r);
+      context.arcTo(x, y + h, x, y, r);
+      context.arcTo(x, y, x + w, y, r);
+      context.closePath();
+    }
+
+    function renderLayout() {
+      const W = 250;
+      const H = 128;
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, W, H);
+
+      const pad = 3;
+      const gap = 4;
+      const leftW = 120;
+      const rightX = pad + leftW + gap;
+      const rightW = W - rightX - pad;
+      const halfH = (H - pad * 2 - gap) / 2;
+
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 1.2;
+
+      roundRect(ctx, pad, pad, leftW, H - pad * 2, 5);
+      ctx.stroke();
+
+      roundRect(ctx, rightX, pad, rightW, halfH, 5);
+      ctx.stroke();
+
+      const bottomY = pad + halfH + gap;
+      roundRect(ctx, rightX, bottomY, rightW, halfH, 5);
+      ctx.stroke();
+
+      if (loadedImage) {
+        ctx.save();
+        roundRect(ctx, pad + 1, pad + 1, leftW - 2, H - pad * 2 - 2, 4);
+        ctx.clip();
+        drawProcessedImage(loadedImage, pad + 1, pad + 1, leftW - 2, H - pad * 2 - 2);
+        ctx.restore();
+      } else {
+        const cx = pad + leftW / 2;
+        ctx.fillStyle = '#000000';
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1.5;
+
+        ctx.strokeRect(cx - 10, 32, 20, 16);
+        ctx.beginPath();
+        ctx.arc(cx + 4, 37, 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(cx - 8, 46);
+        ctx.lineTo(cx - 2, 40);
+        ctx.lineTo(cx + 2, 44);
+        ctx.lineTo(cx + 6, 41);
+        ctx.lineTo(cx + 9, 46);
+        ctx.stroke();
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText('ẢNH', cx, 66);
+
+        ctx.font = '9.5px sans-serif';
+        ctx.fillText('Ảnh cá nhân,', cx, 81);
+        ctx.fillText('phong cảnh, gia', cx, 93);
+        ctx.fillText('đình...', cx, 105);
+      }
+
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const days = ['Chủ Nhật', 'Thứ Hai', 'Thứ Ba', 'Thứ Tư', 'Thứ Năm', 'Thứ Sáu', 'Thứ Bảy'];
+      const dayName = days[now.getDay()];
+      const dd = String(now.getDate()).padStart(2, '0');
+      const mo = String(now.getMonth() + 1).padStart(2, '0');
+      const yyyy = now.getFullYear();
+
+      const rCenter = rightX + rightW / 2;
+      ctx.fillStyle = '#000000';
+      ctx.textAlign = 'center';
+
+      ctx.font = 'bold 24px sans-serif';
+      ctx.fillText(`${hh}:${mm}`, rCenter, pad + 26);
+
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 10px sans-serif';
+      ctx.fillText(`${dayName} ·`, rightX + 8, pad + 40);
+      ctx.fillText(`${dd}/${mo}/${yyyy}`, rightX + 8, pad + 52);
+
+      const quote = quoteInput.value.trim() || 'Một ngày mới, một khởi đầu mới.';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 11px sans-serif';
+      wrapText(ctx, quote, rCenter, bottomY + 19, rightW - 10, 14);
+    }
+
+    function wrapText(context, text, x, y, maxWidth, lineHeight) {
+      const words = text.split(/\s+/);
+      let line = '';
+      let curY = y;
+      let lineCount = 0;
+      for (let n = 0; n < words.length; n++) {
+        const testLine = line + words[n] + ' ';
+        if (context.measureText(testLine).width > maxWidth && n > 0) {
+          context.fillText(line.trim(), x, curY);
+          line = words[n] + ' ';
+          curY += lineHeight;
+          lineCount++;
+          if (lineCount >= 3) break;
+        } else {
+          line = testLine;
+        }
+      }
+      if (lineCount < 3) {
+        context.fillText(line.trim(), x, curY);
+      }
+    }
+
+    function drawProcessedImage(img, dx, dy, dw, dh) {
+      const temp = document.createElement('canvas');
+      temp.width = dw;
+      temp.height = dh;
+      const tctx = temp.getContext('2d');
+
+      const scale = Math.max(dw / img.width, dh / img.height);
+      const sw = dw / scale;
+      const sh = dh / scale;
+      const sx = (img.width - sw) / 2;
+      const sy = (img.height - sh) / 2;
+
+      tctx.drawImage(img, sx, sy, sw, sh, 0, 0, dw, dh);
+      const imgData = tctx.getImageData(0, 0, dw, dh);
+      const data = imgData.data;
+      const gray = new Float32Array(dw * dh);
+
+      for (let i = 0; i < dw * dh; i++) {
+        gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+      }
+
+      const useDither = ditherMode.value === 'dither';
+      for (let y = 0; y < dh; y++) {
+        for (let x = 0; x < dw; x++) {
+          const idx = y * dw + x;
+          const oldVal = gray[idx];
+          const newVal = oldVal < 128 ? 0 : 255;
+          gray[idx] = newVal;
+
+          if (useDither) {
+            const err = oldVal - newVal;
+            if (x + 1 < dw) gray[idx + 1] += (err * 7) / 16;
+            if (y + 1 < dh) {
+              if (x > 0) gray[idx + dw - 1] += (err * 3) / 16;
+              gray[idx + dw] += (err * 5) / 16;
+              if (x + 1 < dw) gray[idx + dw + 1] += (err * 1) / 16;
+            }
+          }
+
+          const p = idx * 4;
+          data[p] = data[p + 1] = data[p + 2] = newVal;
+          data[p + 3] = 255;
+        }
+      }
+      tctx.putImageData(imgData, 0, 0);
+      ctx.drawImage(temp, dx, dy);
+    }
+
+    function canvas2bytes_bw(sourceCanvas, type = 'bw') {
+      const sctx = sourceCanvas.getContext('2d');
+      const imageData = sctx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+      const arr = [];
+      let buffer = [];
+
+      for (let x = sourceCanvas.width - 1; x >= 0; x--) {
+        for (let y = 0; y < sourceCanvas.height; y++) {
+          const index = (sourceCanvas.width * 4 * y) + x * 4;
+          if (type !== 'bwr') {
+            const isRed = imageData.data[index] > 160 &&
+                          imageData.data[index] > imageData.data[index + 1] &&
+                          imageData.data[index] > imageData.data[index + 2];
+            const isWhite = (type === 'bwr-black' && isRed) ||
+                            (imageData.data[index] > 128 &&
+                             imageData.data[index + 1] > 128 &&
+                             imageData.data[index + 2] > 128);
+            buffer.push(isWhite ? 1 : 0);
+          } else {
+            const isRed = imageData.data[index] > 160 &&
+                          imageData.data[index + 1] < 80 &&
+                          imageData.data[index + 2] < 80;
+            buffer.push(isRed ? 1 : 0);
+          }
+
+          if (buffer.length === 8) {
+            arr.push(parseInt(buffer.join(''), 2));
+            buffer = [];
+          }
+        }
+      }
+      return new Uint8Array(arr);
+    }
+
+    function handleNrf52Notification(event) {
+      const value = event.target.value;
+      const data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      const text = new TextDecoder().decode(data);
+
+      if (text.startsWith('mtu=')) {
+        const mtu = parseInt(text.substring(4), 10);
+        if (Number.isFinite(mtu) && mtu > 2) {
+          nrf52ImageChunkSize = Math.max(18, Math.min(244, mtu - 2));
+          log(`> MTU=${mtu}, chunk=${nrf52ImageChunkSize} bytes`);
+        }
+        return;
+      }
+
+      if (data.length >= 8 && data.length <= 64 && [1, 2, 3, 4, 5, 7].includes(data[7])) {
+        nrf52ModelId = data[7];
+        log(`> Đã nhận diện màn hình model=${nrf52ModelId}`);
+        if (nrf52ModelId === 2) {
+          panelColorMode.value = 'bwr';
+        }
+      }
+    }
+
+    async function sendCommand(cmd) {
+      if (!epdCharacteristic || !gattServer || !gattServer.connected) {
+        throw new Error('Thiết bị chưa kết nối.');
+      }
+      await enqueueGattWrite(epdCharacteristic, cmd);
+    }
+
+    async function sendNrf52ImagePlane(data, blackPlane, startPct, endPct) {
+      const chunkSize = nrf52ImageChunkSize;
+      const total = Math.ceil(data.length / chunkSize);
+
+      for (let offset = 0, part = 0; offset < data.length; offset += chunkSize, part++) {
+        const chunk = data.slice(offset, offset + chunkSize);
+        const begin = offset === 0 ? 0x00 : 0xf0;
+        const plane = blackPlane ? 0x0f : 0x00;
+        const packet = new Uint8Array([NRF52_CMD_WRITE_IMAGE, begin | plane, ...chunk]);
+
+        await sendCommand(packet);
+
+        const completed = part + 1;
+        const pct = Math.round(startPct + (completed / total) * (endPct - startPct));
+        statusLabel.textContent = `Đang nạp màn hình: ${pct}% (${completed}/${total})`;
+        await delay(10);
+      }
+    }
+
+    btnConnect.addEventListener('click', async () => {
+      if (isBusy) return;
+      logBox.innerHTML = '';
+
+      try {
+        if (!navigator.bluetooth) {
+          throw new Error('Trình duyệt không hỗ trợ Web Bluetooth.');
+        }
+
+        if (gattServer && gattServer.connected && bleDevice) {
+          bleDevice.gatt.disconnect();
+          return;
+        }
+
+        statusLabel.textContent = 'Đang tìm NRF_EPD...';
+        log('Đang tìm NRF_EPD...');
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'NRF_EPD' }],
+          optionalServices: [NRF52_SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', () => {
+          epdCharacteristic = null;
+          gattServer = null;
+          btnConnect.textContent = '1. Kết nối NRF_EPD_4E45';
+          statusLabel.textContent = 'Đã ngắt kết nối';
+          log('Đã ngắt kết nối thiết bị.', true);
+        });
+
+        statusLabel.textContent = `Đang kết nối ${bleDevice.name}...`;
+        gattServer = await bleDevice.gatt.connect();
+        log(`Đã kết nối ${bleDevice.name}`);
+
+        await delay(500);
+
+        log('> Đang mở dịch vụ nRF52...');
+        const epdService = await gattServer.getPrimaryService(NRF52_SERVICE_UUID);
+        epdCharacteristic = await epdService.getCharacteristic(NRF52_CHARACTERISTIC_UUID);
+
+        epdCharacteristic.addEventListener('characteristicvaluechanged', handleNrf52Notification);
+
+        log('> Đang bật Notify...');
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await epdCharacteristic.startNotifications();
+            break;
+          } catch (e) {
+            if (attempt === 3) throw e;
+            await delay(300 * attempt);
+          }
+        }
+
+        await delay(150);
+
+        log('> Đang gửi lệnh INIT (0x01)...');
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await sendCommand(new Uint8Array([NRF52_CMD_INIT]));
+            break;
+          } catch (e) {
+            if (attempt === 3) throw e;
+            await delay(250 * attempt);
+          }
+        }
+
+        btnConnect.textContent = `Ngắt kết nối (${bleDevice.name})`;
+        statusLabel.textContent = `Đã kết nối ${bleDevice.name} - Sẵn sàng!`;
+        log('> Kết nối & khởi tạo thành công!');
+      } catch (err) {
+        epdCharacteristic = null;
+        log(err.message || String(err), true);
+      }
+    });
+
+    async function uploadCanvasToEpd(targetCanvas, label) {
+      if (isBusy) return;
+      if (!epdCharacteristic || !gattServer || !gattServer.connected) {
+        log('Vui lòng bấm nút 1 để kết nối NRF_EPD_4E45 trước!', true);
+        return;
+      }
+
+      isBusy = true;
+      btnSend.disabled = true;
+      btnClear.disabled = true;
+
+      try {
+        statusLabel.textContent = `Đang khởi tạo (${label})...`;
+        log(`Bắt đầu gửi ${label} (250x128)...`);
+
+        if (nrf52ModelId === 2) {
+          const ts = Math.floor(Date.now() / 1000);
+          const tz = Math.round(-new Date().getTimezoneOffset() / 60);
+          await sendCommand(new Uint8Array([
+            NRF52_CMD_SET_TIME,
+            (ts >>> 24) & 0xff, (ts >>> 16) & 0xff, (ts >>> 8) & 0xff, ts & 0xff,
+            tz & 0xff, 0x00
+          ]));
+          await delay(150);
+        }
+
+        await sendCommand(new Uint8Array([NRF52_CMD_INIT]));
+        await delay(120);
+
+        const isBwr = panelColorMode.value === 'bwr' || nrf52ModelId === 2;
+        const blackBytes = canvas2bytes_bw(targetCanvas, isBwr ? 'bwr-black' : 'bw');
+
+        await sendNrf52ImagePlane(blackBytes, true, 0, isBwr ? 48 : 95);
+
+        if (isBwr) {
+          const redBytes = canvas2bytes_bw(targetCanvas, 'bwr').map((b) => b ^ 0xff);
+          await sendNrf52ImagePlane(redBytes, false, 48, 95);
+        }
+
+        statusLabel.textContent = 'Đang làm tươi (Refresh) màn hình E-Ink...';
+        log('> Đang refresh màn hình...');
+        await sendCommand(new Uint8Array([NRF52_CMD_REFRESH]));
+
+        statusLabel.textContent = 'Hoàn tất! Kiểm tra màn hình E-Ink.';
+        log('Gửi bố cục thành công 100%!');
+      } catch (err) {
+        log(err.message || String(err), true);
+      } finally {
+        isBusy = false;
+        btnSend.disabled = false;
+        btnClear.disabled = false;
+      }
+    }
+
+    imgInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          loadedImage = img;
+          renderLayout();
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    btnPreview.addEventListener('click', renderLayout);
+    quoteInput.addEventListener('input', renderLayout);
+    ditherMode.addEventListener('change', renderLayout);
+
+    btnClear.addEventListener('click', async () => {
+      const whiteCanvas = document.createElement('canvas');
+      whiteCanvas.width = 250;
+      whiteCanvas.height = 128;
+      const wctx = whiteCanvas.getContext('2d');
+      wctx.fillStyle = '#FFFFFF';
+      wctx.fillRect(0, 0, 250, 128);
+      await uploadCanvasToEpd(whiteCanvas, 'Xoá trắng');
+    });
+
+    btnSend.addEventListener('click', async () => {
+      renderLayout();
+      await uploadCanvasToEpd(canvas, 'Bố cục mới');
+    });
+
+    renderLayout();
+  </script>
+</body>
+</html>
